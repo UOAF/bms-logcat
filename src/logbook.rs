@@ -1,16 +1,16 @@
 use std::{
     collections::BTreeSet,
     fs::File,
-    io::{prelude::*, BufReader},
+    io::{prelude::*, BufReader, BufWriter},
 };
 
 use anyhow::{anyhow, ensure, Context, Result};
 use byte_struct::*;
-use byteorder::{ReadBytesExt, LE};
+use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use camino::{Utf8Path, Utf8PathBuf};
 use enum_iterator::IntoEnumIterator;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Copy, Clone, IntoPrimitive, TryFromPrimitive, Serialize, Deserialize)]
 #[repr(i32)]
@@ -24,7 +24,9 @@ pub enum Rank {
     BrigadierGeneral,
 }
 
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, IntoEnumIterator, Serialize, Deserialize)]
+#[derive(
+    Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, IntoEnumIterator, Serialize, Deserialize,
+)]
 pub enum Medals {
     AirForceCross,
     SilverStar,
@@ -88,15 +90,15 @@ pub struct Logbook {
     pub voice: i16,
 }
 
+const FILENAME_LEN: usize = 32;
+const PASSWORD_LEN: usize = 10;
+const CALLSIGN_LEN: usize = 12;
+const PERSONAL_TEXT_LEN: usize = 120;
+const COMM_LEN: usize = 12;
+const NAME_LEN: usize = 20;
+
 impl Logbook {
     fn parse<R: Read>(mut r: DecryptRead<R>) -> Result<Self> {
-        const FILENAME_LEN: usize = 32;
-        const PASSWORD_LEN: usize = 10;
-        const CALLSIGN_LEN: usize = 12;
-        const PERSONAL_TEXT_LEN: usize = 120;
-        const COMM_LEN: usize = 12;
-        const NAME_LEN: usize = 20;
-
         let mut name_buf = [0; NAME_LEN + 1];
         r.read_exact(&mut name_buf)?;
         let name = buf_to_str(&name_buf)?.to_owned();
@@ -196,11 +198,76 @@ impl Logbook {
             voice,
         })
     }
+
+    fn write<W: Write>(&self, w: &mut EncryptWrite<W>) -> Result<()> {
+        write_padded(w, &self.name, NAME_LEN + 1)?;
+        write_padded(w, &self.callsign, CALLSIGN_LEN + 1)?;
+        w.write_all(&[0; PASSWORD_LEN + 1])?;
+        write_padded(w, &self.commissioned, COMM_LEN + 1)?;
+        write_padded(w, &self.options_file, CALLSIGN_LEN + 1)?;
+        w.write_all(&[0; 1])?;
+        w.write_f32::<LE>(self.flight_hours)?;
+        w.write_f32::<LE>(self.ace_factor)?;
+        w.write_i32::<LE>(self.rank.into())?;
+
+        assert_eq!(w.position() % 4, 0);
+        let mut dogfight_buf = [0; DogfightStats::BYTE_LEN];
+        self.dogfight_stats.write_bytes(&mut dogfight_buf);
+        w.write_all(&dogfight_buf)?;
+
+        assert_eq!(w.position() % 4, 0);
+        let mut campaign_buf = [0; CampaignStats::BYTE_LEN];
+        self.campaign_stats.write_bytes(&mut campaign_buf);
+        w.write_all(&campaign_buf)?;
+
+        w.write_all(&[0; 2])?;
+        assert_eq!(w.position() % 4, 0);
+
+        for m in Medals::into_enum_iter() {
+            w.write_all(&[self.medals.contains(&m) as u8])?;
+        }
+
+        w.write_all(&[0; 2])?;
+        assert_eq!(w.position() % 4, 0);
+
+        // Skip picture resource ID
+        w.write_all(&[0; 4])?;
+
+        write_padded(w, &self.picture_file, FILENAME_LEN + 1)?;
+
+        w.write_all(&[0; 3])?;
+        assert_eq!(w.position() % 4, 0);
+
+        // Skip patch resource ID
+        w.write_all(&[0; 4])?;
+
+        write_padded(w, &self.patch_file, FILENAME_LEN + 1)?;
+        write_padded(w, &self.personal_text, PERSONAL_TEXT_LEN + 1)?;
+        write_padded(w, &self.squadron, NAME_LEN)?;
+
+        ensure!(self.voice < 12, "voice index {} > 11", self.voice);
+        w.write_i16::<LE>(self.voice)?;
+
+        w.write_u32::<LE>(0)?; // "checksum
+
+        Ok(())
+    }
 }
 
 fn buf_to_str(buf: &[u8]) -> Result<&str> {
     Ok(std::str::from_utf8(buf)?.split('\0').next().unwrap())
 }
+
+fn write_padded<W: Write, S: AsRef<str>>(w: &mut W, s: S, pad_to: usize) -> std::io::Result<()> {
+    let s = s.as_ref();
+    assert!(s.len() <= pad_to);
+
+    w.write_all(s.as_bytes())?;
+    let padding = vec![0; pad_to - s.len()];
+    w.write_all(&padding)
+}
+
+const MASTER_KEY: &[u8] = b"Falcon is your Master";
 
 struct DecryptRead<R> {
     inner: R,
@@ -226,8 +293,6 @@ impl<R: Read> Read for DecryptRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let amount_read = self.inner.read(buf)?;
 
-        const MASTER_KEY: &[u8] = b"Falcon is your Master";
-
         for b in &mut buf[..amount_read] {
             let next = *b;
             *b ^= self.start;
@@ -241,16 +306,85 @@ impl<R: Read> Read for DecryptRead<R> {
     }
 }
 
+struct EncryptWrite<W> {
+    inner: W,
+    start: u8,
+    bytes_written: usize,
+}
+
+impl<W: Write> EncryptWrite<W> {
+    fn new(inner: W, start: u8) -> Self {
+        Self {
+            inner,
+            start,
+            bytes_written: 0,
+        }
+    }
+
+    fn position(&self) -> usize {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for EncryptWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut this_write: usize = 0;
+
+        for b in buf {
+            let mut to_write = *b;
+            to_write ^= MASTER_KEY[self.bytes_written % MASTER_KEY.len()];
+            to_write ^= self.start;
+
+            match self.inner.write(&[to_write]) {
+                Ok(0) => break,
+                Ok(1) => {
+                    this_write += 1;
+                    self.bytes_written += 1;
+                    self.start = to_write;
+                }
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    if this_write == 0 {
+                        return Err(e);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(this_write)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub fn read(path: &Utf8Path) -> Result<Logbook> {
     let reader: Box<dyn Read> = match path.as_str() {
         "-" => Box::new(std::io::stdin()),
         p => {
-            let f = File::open(p).with_context(|| format!("Couldn't open {}", p))?;
+            let f = File::open(p).with_context(|| format!("Couldn't open {p}"))?;
             Box::new(f)
         }
     };
 
     let decryptor = DecryptRead::new(BufReader::new(reader), 0x58);
-
     Logbook::parse(decryptor)
+}
+
+pub fn write(book: &Logbook, path: &Utf8Path) -> Result<()> {
+    let writer: Box<dyn Write> = match path.as_str() {
+        "-" => Box::new(std::io::stdout()),
+        p => {
+            let f = File::create(p).with_context(|| format!("Couldn't create {p}"))?;
+            Box::new(f)
+        }
+    };
+
+    let mut encryptor = EncryptWrite::new(BufWriter::new(writer), 0x58);
+    book.write(&mut encryptor)?;
+    encryptor.flush()?;
+    Ok(())
 }

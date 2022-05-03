@@ -1,7 +1,7 @@
 mod logbook;
 mod logsetup;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use log::*;
@@ -12,13 +12,22 @@ use logsetup::init_logger;
 enum Command {
     /// Read the given logbook and print it to the given file, or `-` for stdout
     Read {
+        /// Pretty-print the JSON output
         #[clap(short, long)]
         pretty: bool,
 
-        file: Utf8PathBuf,
+        /// `*.lbk` to read
+        logbook: Utf8PathBuf,
     },
-    /// Read the given logbook JSON and print it to stdout
-    Write { file: Utf8PathBuf },
+    /// Read the given JSON and write it back out as a logbook
+    Write {
+        /// File to write to, or `-` for stdout
+        #[clap(short, long)]
+        output: Utf8PathBuf,
+
+        /// JSON file to read, or `-` for stdin
+        json: Utf8PathBuf,
+    },
 }
 
 /// Read and write Falcon BMS logbooks
@@ -47,15 +56,26 @@ fn run() -> Result<()> {
     init_logger(args.verbose, args.color);
 
     match args.command {
-        Command::Read { pretty, file } => {
-            let book = logbook::read(&file)?;
+        Command::Read { pretty, logbook } => {
+            let book = logbook::read(&logbook)?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&book)?);
             } else {
                 println!("{}", serde_json::to_string(&book)?);
             }
         }
-        Command::Write { file: _ } => {}
+        Command::Write { output, json } => {
+            let f: Box<dyn std::io::Read> = if json.as_str() == "-" {
+                Box::new(std::io::stdin())
+            } else {
+                Box::new(
+                    std::fs::File::open(&json).with_context(|| format!("Couldn't open {json}"))?,
+                )
+            };
+            let book: logbook::Logbook = serde_json::from_reader(std::io::BufReader::new(f))
+                .with_context(|| format!("Couldn't parse {json}"))?;
+            logbook::write(&book, &output)?;
+        }
     }
     Ok(())
 }
