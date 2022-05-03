@@ -10,8 +10,9 @@ use byteorder::{ReadBytesExt, LE};
 use camino::{Utf8Path, Utf8PathBuf};
 use enum_iterator::IntoEnumIterator;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Copy, Clone, IntoPrimitive, TryFromPrimitive)]
+#[derive(Debug, Copy, Clone, IntoPrimitive, TryFromPrimitive, Serialize, Deserialize)]
 #[repr(i32)]
 pub enum Rank {
     SecondLt,
@@ -23,7 +24,7 @@ pub enum Rank {
     BrigadierGeneral,
 }
 
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, IntoEnumIterator)]
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, IntoEnumIterator, Serialize, Deserialize)]
 pub enum Medals {
     AirForceCross,
     SilverStar,
@@ -33,7 +34,7 @@ pub enum Medals {
     Longevity,
 }
 
-#[derive(Debug, Default, ByteStruct)]
+#[derive(Debug, Default, ByteStruct, Serialize, Deserialize)]
 #[byte_struct_le]
 pub struct DogfightStats {
     pub matches_won: i16,
@@ -46,7 +47,7 @@ pub struct DogfightStats {
     pub killed_versus_humans: i16,
 }
 
-#[derive(Debug, Default, ByteStruct)]
+#[derive(Debug, Default, ByteStruct, Serialize, Deserialize)]
 #[byte_struct_le]
 pub struct CampaignStats {
     pub games_won: i16,
@@ -68,7 +69,7 @@ pub struct CampaignStats {
     pub missions_since_last_friendly_kill: i16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Logbook {
     pub name: String,
     pub callsign: String,
@@ -104,7 +105,8 @@ impl Logbook {
         r.read_exact(&mut callsign_buf)?;
         let callsign = buf_to_str(&callsign_buf)?.to_owned();
 
-        r.read_exact(&mut [0; PASSWORD_LEN + 1])?;
+        let mut pw_buf = [0; PASSWORD_LEN + 1];
+        r.read_exact(&mut pw_buf)?;
 
         let mut commission_buf = [0; COMM_LEN + 1];
         r.read_exact(&mut commission_buf)?;
@@ -197,7 +199,7 @@ impl Logbook {
 }
 
 fn buf_to_str(buf: &[u8]) -> Result<&str> {
-    Ok(std::str::from_utf8(buf)?.trim_end_matches('\0'))
+    Ok(std::str::from_utf8(buf)?.split('\0').next().unwrap())
 }
 
 struct DecryptRead<R> {
