@@ -1,13 +1,9 @@
-use std::{
-    collections::BTreeSet,
-    fs::File,
-    io::{prelude::*, BufReader, BufWriter},
-};
+use std::{collections::BTreeSet, io::prelude::*};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, ensure, Result};
 use byte_struct::*;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use enum_iterator::IntoEnumIterator;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
@@ -75,6 +71,7 @@ pub struct CampaignStats {
 pub struct Logbook {
     pub name: String,
     pub callsign: String,
+    pub password: String,
     pub commissioned: String,
     pub options_file: Utf8PathBuf,
     pub flight_hours: f32,
@@ -98,7 +95,9 @@ const COMM_LEN: usize = 12;
 const NAME_LEN: usize = 20;
 
 impl Logbook {
-    fn parse<R: Read>(mut r: DecryptRead<R>) -> Result<Self> {
+    pub fn parse<R: Read>(r: R) -> Result<Self> {
+        let mut r = DecryptRead::new(r, 0x58);
+
         let mut name_buf = [0; NAME_LEN + 1];
         r.read_exact(&mut name_buf)?;
         let name = buf_to_str(&name_buf)?.to_owned();
@@ -109,6 +108,8 @@ impl Logbook {
 
         let mut pw_buf = [0; PASSWORD_LEN + 1];
         r.read_exact(&mut pw_buf)?;
+        xor_password(&mut pw_buf);
+        let password = buf_to_str(&pw_buf)?.to_owned();
 
         let mut commission_buf = [0; COMM_LEN + 1];
         r.read_exact(&mut commission_buf)?;
@@ -183,6 +184,7 @@ impl Logbook {
         Ok(Self {
             name,
             callsign,
+            password,
             commissioned,
             options_file,
             flight_hours,
@@ -199,10 +201,15 @@ impl Logbook {
         })
     }
 
-    fn write<W: Write>(&self, w: &mut EncryptWrite<W>) -> Result<()> {
+    pub fn write<W: Write>(&self, w: W) -> Result<()> {
+        let mut w = EncryptWrite::new(w, 0x58);
+        let w = &mut w;
+
         write_padded(w, &self.name, NAME_LEN + 1)?;
         write_padded(w, &self.callsign, CALLSIGN_LEN + 1)?;
-        w.write_all(&[0; PASSWORD_LEN + 1])?;
+
+        write_password(w, &self.password)?;
+
         write_padded(w, &self.commissioned, COMM_LEN + 1)?;
         write_padded(w, &self.options_file, CALLSIGN_LEN + 1)?;
         w.write_all(&[0; 1])?;
@@ -258,13 +265,19 @@ fn buf_to_str(buf: &[u8]) -> Result<&str> {
     Ok(std::str::from_utf8(buf)?.split('\0').next().unwrap())
 }
 
-fn write_padded<W: Write, S: AsRef<str>>(w: &mut W, s: S, pad_to: usize) -> std::io::Result<()> {
+fn write_padded<W: Write, S: AsRef<str>>(w: &mut W, s: S, pad_to: usize) -> Result<()> {
     let s = s.as_ref();
-    assert!(s.len() <= pad_to);
+    ensure!(
+        s.len() < pad_to,
+        "{s} is longer than the allowed length ({})",
+        pad_to - 1
+    );
 
     w.write_all(s.as_bytes())?;
     let padding = vec![0; pad_to - s.len()];
-    w.write_all(&padding)
+    w.write_all(&padding)?;
+
+    Ok(())
 }
 
 const MASTER_KEY: &[u8] = b"Falcon is your Master";
@@ -361,30 +374,32 @@ impl<W: Write> Write for EncryptWrite<W> {
     }
 }
 
-pub fn read(path: &Utf8Path) -> Result<Logbook> {
-    let reader: Box<dyn Read> = match path.as_str() {
-        "-" => Box::new(std::io::stdin()),
-        p => {
-            let f = File::open(p).with_context(|| format!("Couldn't open {p}"))?;
-            Box::new(f)
-        }
-    };
+fn xor_password(pw: &mut [u8]) {
+    const MASK1: &[u8] = b"Who needs a password!";
+    const MASK2: &[u8] = b"Repend, Falcon is coming!";
 
-    let decryptor = DecryptRead::new(BufReader::new(reader), 0x58);
-    Logbook::parse(decryptor)
+    assert_eq!(pw.len(), PASSWORD_LEN + 1);
+
+    // Despite being XOR'd to hell, the password is null-terminated
+    assert_eq!(pw[PASSWORD_LEN], 0);
+
+    for (i, b) in pw.iter_mut().take(PASSWORD_LEN).enumerate() {
+        *b ^= MASK1[i % MASK1.len()];
+        *b ^= MASK2[i % MASK2.len()];
+    }
 }
 
-pub fn write(book: &Logbook, path: &Utf8Path) -> Result<()> {
-    let writer: Box<dyn Write> = match path.as_str() {
-        "-" => Box::new(std::io::stdout()),
-        p => {
-            let f = File::create(p).with_context(|| format!("Couldn't create {p}"))?;
-            Box::new(f)
-        }
-    };
+fn write_password<W: Write>(w: &mut W, pw: &str) -> Result<()> {
+    ensure!(
+        pw.len() <= PASSWORD_LEN,
+        "password {pw} is longer than the allowed length ({PASSWORD_LEN})"
+    );
 
-    let mut encryptor = EncryptWrite::new(BufWriter::new(writer), 0x58);
-    book.write(&mut encryptor)?;
-    encryptor.flush()?;
+    let mut buf: Vec<u8> = pw.as_bytes().to_owned();
+    buf.resize(PASSWORD_LEN + 1, 0);
+    xor_password(&mut buf);
+
+    w.write_all(&buf)?;
+
     Ok(())
 }
