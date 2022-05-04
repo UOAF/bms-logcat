@@ -28,6 +28,17 @@ enum Command {
         /// JSON file to read, or `-` for stdin
         json: Utf8PathBuf,
     },
+    /// Create a default logbook, commissioned today.
+    WriteDefault {
+        #[clap(short, long)]
+        name: String,
+
+        #[clap(short, long)]
+        callsign: String,
+
+        #[clap(short, long)]
+        password: Option<String>,
+    },
 }
 
 /// Read and write Falcon BMS logbooks
@@ -82,6 +93,16 @@ fn run() -> Result<()> {
             let r = reader(&json)?;
             let book: Logbook =
                 serde_json::from_reader(r).with_context(|| format!("Couldn't parse {json}"))?;
+
+            let mut w = writer(&output)?;
+            book.write(&mut w)?;
+
+            w.flush()
+                .with_context(|| format!("Couldn't flush logbook to {output}"))?;
+        },
+        Command::WriteDefault { name, callsign, password } => {
+            let password = password.unwrap_or_default();
+            let book = Logbook::new(name, callsign, password)?;
 
             let mut w = writer(&output)?;
             book.write(&mut w)?;

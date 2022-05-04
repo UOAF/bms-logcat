@@ -20,6 +20,12 @@ pub enum Rank {
     BrigadierGeneral,
 }
 
+impl Default for Rank {
+    fn default() -> Self {
+        Rank::SecondLt
+    }
+}
+
 #[derive(
     Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq, IntoEnumIterator, Serialize, Deserialize,
 )]
@@ -67,7 +73,7 @@ pub struct CampaignStats {
     pub missions_since_last_friendly_kill: i16,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Logbook {
     pub name: String,
     pub callsign: String,
@@ -95,6 +101,23 @@ const COMM_LEN: usize = 12;
 const NAME_LEN: usize = 20;
 
 impl Logbook {
+    pub fn new(name: String, callsign: String, password: String) -> Result<Self> {
+        let options_file = Utf8PathBuf::from(&callsign);
+
+        let commissioned = time::OffsetDateTime::now_local()?.format(
+            time::macros::format_description!("[month]/[day]/[year repr:last_two]"),
+        )?;
+
+        Ok(Self {
+            name,
+            callsign,
+            password,
+            options_file,
+            commissioned,
+            ..Default::default()
+        })
+    }
+
     pub fn parse<R: Read>(r: R) -> Result<Self> {
         let mut r = DecryptRead::new(r, 0x58);
 
